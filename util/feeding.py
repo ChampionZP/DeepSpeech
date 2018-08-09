@@ -1,12 +1,105 @@
+import numpy as np
+import os
 import pandas
+import tables
 import tensorflow as tf
 
-from threading import Thread
+from functools import partial
 from math import ceil
+from multiprocessing.dummy import Pool
 from six.moves import range
+from threading import Thread
 from util.audio import audiofile_to_input_vector
 from util.gpu import get_available_gpus
 from util.text import ctc_label_dense_to_sparse, text_to_char_array
+
+
+def pmap(fun, iterable, threads=8):
+    pool = Pool(threads)
+    results = pool.map(fun, iterable)
+    pool.close()
+    return results
+
+
+def process_single_file(row, numcep, numcontext, alphabet):
+    # row = index, Series
+    _, file = row
+    features = audiofile_to_input_vector(file.wav_filename, numcep, numcontext)
+    transcript = text_to_char_array(file.transcript, alphabet)
+
+    return features, len(features), transcript, len(transcript)
+
+
+# load samples from CSV, compute features, optionally cache results on disk
+def preprocess(csv_files, batch_size, numcep, numcontext, alphabet, hdf5_cache_path=None):
+    COLUMNS = ('features', 'features_len', 'transcript', 'transcript_len')
+
+    print('Preprocessing', csv_files)
+
+    if hdf5_cache_path and os.path.exists(hdf5_cache_path):
+        with tables.open_file(hdf5_cache_path, 'r') as file:
+            features = file.root.features[:]
+            features_len = file.root.features_len[:]
+            transcript = file.root.transcript[:]
+            transcript_len = file.root.transcript_len[:]
+
+            # features are stored flattened, so reshape into
+            # [n_steps, (n_input + 2*n_context*n_input)]
+            for i in range(len(features)):
+                features[i] = np.reshape(features[i], [features_len[i], -1])
+
+            in_data = list(zip(features, features_len,
+                               transcript, transcript_len))
+            print('Loaded from cache at', hdf5_cache_path)
+            return pandas.DataFrame(data=in_data, columns=COLUMNS)
+
+    source_data = None
+    for csv in csv_files:
+        file = pandas.read_csv(csv, encoding='utf-8', na_filter=False)
+        if source_data is None:
+            source_data = file
+        else:
+            source_data = source_data.append(file)
+
+    # # discard last samples if dataset does not divide batch size evenly
+    # if len(source_data) % batch_size != 0:
+    #     source_data = source_data[:-(len(source_data) % batch_size)]
+
+    out_data = pmap(partial(process_single_file, numcep=numcep, numcontext=numcontext, alphabet=alphabet), source_data.iterrows())
+
+    if hdf5_cache_path:
+        print('Saving to', hdf5_cache_path)
+
+        # list of tuples -> tuple of lists
+        features, features_len, transcript, transcript_len = zip(*out_data)
+
+        with tables.open_file(hdf5_cache_path, 'w') as file:
+            features_dset = file.create_vlarray(file.root,
+                                                'features',
+                                                tables.Float32Atom(),
+                                                filters=tables.Filters(complevel=1))
+            # VLArray atoms need to be 1D, so flatten feature array
+            for f in features:
+                features_dset.append(np.reshape(f, -1))
+
+            features_len_dset = file.create_array(file.root,
+                                                  'features_len',
+                                                  features_len)
+
+            transcript_dset = file.create_vlarray(file.root,
+                                                  'transcript',
+                                                  tables.Int32Atom(),
+                                                  filters=tables.Filters(complevel=1))
+            for t in transcript:
+                transcript_dset.append(t)
+
+            transcript_len_dset = file.create_array(file.root,
+                                                    'transcript_len',
+                                                    transcript_len)
+
+    print('Preprocessing done')
+    return pandas.DataFrame(data=out_data, columns=COLUMNS)
+
 
 class ModelFeeder(object):
     '''
@@ -24,7 +117,7 @@ class ModelFeeder(object):
                  numcontext,
                  alphabet,
                  tower_feeder_count=-1,
-                 threads_per_queue=2):
+                 threads_per_queue=4):
 
         self.train = train_set
         self.dev = dev_set
@@ -35,7 +128,7 @@ class ModelFeeder(object):
         self.tower_feeder_count = max(len(get_available_gpus()), 1) if tower_feeder_count < 0 else tower_feeder_count
         self.threads_per_queue = threads_per_queue
 
-        self.ph_x = tf.placeholder(tf.float32, [None, numcep + (2 * numcep * numcontext)])
+        self.ph_x = tf.placeholder(tf.float32, [None, 2*numcontext+1, numcep])
         self.ph_x_length = tf.placeholder(tf.int32, [])
         self.ph_y = tf.placeholder(tf.int32, [None,])
         self.ph_y_length = tf.placeholder(tf.int32, [])
@@ -77,27 +170,19 @@ class ModelFeeder(object):
         '''
         return self._tower_feeders[tower_feeder_index].next_batch()
 
+
 class DataSet(object):
     '''
     Represents a collection of audio samples and their respective transcriptions.
     Takes a set of CSV files produced by importers in /bin.
     '''
-    def __init__(self, csvs, batch_size, skip=0, limit=0, ascending=True, next_index=lambda i: i + 1):
+    def __init__(self, csvs, batch_size, numcep, numcontext, alphabet, skip=0, limit=0, ascending=True, next_index=lambda i: i + 1, hdf5_cache_path=None):
+        self.data = preprocess(csvs, batch_size, numcep, numcontext, alphabet, hdf5_cache_path)
+        self.data = self.data.sort_values(by="features_len", ascending=ascending)
         self.batch_size = batch_size
         self.next_index = next_index
-        self.files = None
-        for csv in csvs:
-            file = pandas.read_csv(csv, encoding='utf-8', na_filter=False)
-            if self.files is None:
-                self.files = file
-            else:
-                self.files = self.files.append(file)
-        self.files = self.files.sort_values(by="wav_filesize", ascending=ascending) \
-                         .ix[:, ["wav_filename", "transcript"]] \
-                         .values[skip:]
-        if limit > 0:
-            self.files = self.files[:limit]
-        self.total_batches = int(ceil(len(self.files) / batch_size))
+        self.total_batches = int(ceil(len(self.data) / batch_size))
+
 
 class _DataSetLoader(object):
     '''
@@ -109,9 +194,9 @@ class _DataSetLoader(object):
     def __init__(self, model_feeder, data_set, alphabet):
         self._model_feeder = model_feeder
         self._data_set = data_set
-        self.queue = tf.PaddingFIFOQueue(shapes=[[None, model_feeder.numcep + (2 * model_feeder.numcep * model_feeder.numcontext)], [], [None,], []],
+        self.queue = tf.PaddingFIFOQueue(shapes=[[None, 2 * model_feeder.numcontext + 1, model_feeder.numcep], [], [None,], []],
                                                   dtypes=[tf.float32, tf.int32, tf.int32, tf.int32],
-                                                  capacity=data_set.batch_size * 2)
+                                                  capacity=data_set.batch_size * 8)
         self._enqueue_op = self.queue.enqueue([model_feeder.ph_x, model_feeder.ph_x_length, model_feeder.ph_y, model_feeder.ph_y_length])
         self._close_op = self.queue.close(cancel_pending_enqueues=True)
         self._alphabet = alphabet
@@ -138,24 +223,40 @@ class _DataSetLoader(object):
         '''
         Queue thread routine.
         '''
-        file_count = len(self._data_set.files)
+        file_count = len(self._data_set.data)
         index = -1
         while not coord.should_stop():
             index = self._data_set.next_index(index) % file_count
-            wav_file, transcript = self._data_set.files[index]
-            source = audiofile_to_input_vector(wav_file, self._model_feeder.numcep, self._model_feeder.numcontext)
-            source_len = len(source)
-            target = text_to_char_array(transcript, self._alphabet)
-            target_len = len(target)
-            if source_len < target_len:
+            features, _, transcript, transcript_len  = self._data_set.data.iloc[index]
+
+            # One stride per time step in the input
+            num_strides = len(features) - (self._model_feeder.numcontext * 2)
+
+            # Create a view into the array with overlapping strides of size
+            # numcontext (past) + 1 (present) + numcontext (future)
+            window_size = 2*self._model_feeder.numcontext+1
+            features = np.lib.stride_tricks.as_strided(
+                features,
+                (num_strides, window_size, self._model_feeder.numcep),
+                (features.strides[0], features.strides[0], features.strides[1]),
+                writeable=False)
+
+            # Flatten the second and third dimensions
+            # try:
+            #     features.shape = (num_strides, -1)
+            # except:
+            #     print('features shape:', features.shape, 'num_strides:', num_strides)
+
+            if num_strides < transcript_len:
                 raise ValueError('Error: Audio file {} is too short for transcription.'.format(wav_file))
             try:
-                session.run(self._enqueue_op, feed_dict={ self._model_feeder.ph_x: source,
-                                                          self._model_feeder.ph_x_length: source_len,
-                                                          self._model_feeder.ph_y: target,
-                                                          self._model_feeder.ph_y_length: target_len })
+                session.run(self._enqueue_op, feed_dict={ self._model_feeder.ph_x: features,
+                                                          self._model_feeder.ph_x_length: num_strides,
+                                                          self._model_feeder.ph_y: transcript,
+                                                          self._model_feeder.ph_y_length: transcript_len })
             except tf.errors.CancelledError:
                 return
+
 
 class _TowerFeeder(object):
     '''

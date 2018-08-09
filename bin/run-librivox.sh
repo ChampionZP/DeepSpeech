@@ -24,14 +24,14 @@ else
 fi
 
 python -u DeepSpeech.py \
-  --train_files "$COMPUTE_DATA_DIR/librivox-train-clean-100.csv,$COMPUTE_DATA_DIR/librivox-train-clean-360.csv,$COMPUTE_DATA_DIR/librivox-train-other-500.csv" \
-  --dev_files "$COMPUTE_DATA_DIR/librivox-dev-clean.csv,$COMPUTE_DATA_DIR/librivox-dev-other.csv" \
-  --test_files "$COMPUTE_DATA_DIR/librivox-test-clean.csv,$COMPUTE_DATA_DIR/librivox-test-other.csv" \
+  --train_files "$COMPUTE_DATA_DIR/librivox-test-clean.csv" \
+  --dev_files "data/ldc93s1/ldc93s1.csv" \
+  --test_files "data/ldc93s1/ldc93s1.csv" \
   --train_batch_size 12 \
   --dev_batch_size 12 \
   --test_batch_size 12 \
   --learning_rate 0.0001 \
-  --epoch 15 \
+  --epoch 1 \
   --display_step 5 \
   --validation_step 5 \
   --dropout_rate 0.30 \

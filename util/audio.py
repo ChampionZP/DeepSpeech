@@ -34,6 +34,8 @@ except ImportError:
         empty_context = np.zeros((numcontext, numcep), dtype=features.dtype)
         features = np.concatenate((empty_context, features, empty_context))
 
+        return features
+
         # Create a view into the array with overlapping strides of size
         # numcontext (past) + 1 (present) + numcontext (future)
         window_size = 2*numcontext+1
